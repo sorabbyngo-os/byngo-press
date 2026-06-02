@@ -1,0 +1,61 @@
+[workspace]
+members = [
+    "crates/bp-core",
+    "crates/bp-domain",
+    "crates/bp-dedup",
+    "crates/bp-dictionary",
+    "crates/bp-delta",
+    "crates/bp-columnar",
+    "crates/bp-simd",
+    "crates/bp-prefetch",
+    "crates/bp-cache",
+    "crates/bp-io",
+    "crates/bp-fs",
+    "crates/bp-cli",
+]
+resolver = "2"
+
+[workspace.package]
+version     = "0.1.0"
+edition     = "2021"
+authors     = ["Sorabbyngo OS <os@sorabbyngo.ai>"]
+license     = "UNLICENSED"
+
+[workspace.dependencies]
+# Async
+tokio        = { version = "1", features = ["full"] }
+
+# Serialization
+serde        = { version = "1", features = ["derive"] }
+serde_json   = "1"
+bincode      = "1"
+
+# Hashing and crypto
+sha2         = "0.10"
+blake3       = "1"
+hex          = "0.4"
+
+# Compression backend
+zstd         = "0.13"
+
+# SIMD
+wide         = "0.7"
+
+# Utils
+uuid         = { version = "1", features = ["v4", "serde"] }
+chrono       = { version = "0.4", features = ["serde"] }
+bytes        = "1"
+memmap2      = "0.9"
+thiserror    = "1"
+anyhow       = "1"
+tracing      = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rayon        = "1"
+num_cpus     = "1"
+crossbeam    = "0.8"
+
+# CLI
+clap         = { version = "4", features = ["derive"] }
+
+# Benchmarking
+criterion    = { version = "0.5", features = ["html_reports"] }

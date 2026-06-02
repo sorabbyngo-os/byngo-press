@@ -1,0 +1,15 @@
+[package]
+name    = "bp-domain"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+bp-core      = { path = "../bp-core" }
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+bytes        = { workspace = true }
+thiserror    = { workspace = true }
+tracing      = { workspace = true }
+chrono       = { workspace = true }
+uuid         = { workspace = true }
+hex          = { workspace = true }

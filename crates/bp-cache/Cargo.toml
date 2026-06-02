@@ -1,0 +1,6 @@
+[package]
+name    = "bp-cache"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]

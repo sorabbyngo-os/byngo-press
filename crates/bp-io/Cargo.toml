@@ -1,0 +1,6 @@
+[package]
+name    = "bp-io"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]

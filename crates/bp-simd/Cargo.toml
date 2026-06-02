@@ -1,0 +1,14 @@
+[package]
+name    = "bp-simd"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+bp-core      = { path = "../bp-core" }
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+zstd         = { workspace = true }
+thiserror    = { workspace = true }
+tracing      = { workspace = true }
+num_cpus     = { workspace = true }
+rayon        = { workspace = true }
