@@ -1,25 +1,24 @@
-use serde::{Deserialize, Serialize};
 use tracing::info;
+use std::collections::HashMap;
 
 use bp_core::error::{BpError, BpResult};
 use bp_core::pipeline::CompressionStage;
 use bp_core::profile::Stage;
 use bp_core::schema::Schema;
 
-use crate::store::ChunkStore;
+use blake3::Hasher;
 
-const CHUNK_SIZE: usize = 4096;
-
-#[derive(Debug, Serialize, Deserialize)]
-struct DedupFrame {
-    store_bytes:   Vec<u8>,
-    refs:          Vec<String>,
-    original_size: u64,
-    /// The actual data — passed through for downstream stages
-    data:          Vec<u8>,
-}
+/// Dedup works at the record level — identical records are stored once
+/// Output is still a JSON array, but with duplicate records replaced by refs
+/// Format: array where each element is either the record or {"_ref": "hash"}
 
 pub struct SemanticDedupStage;
+
+fn blake3_hash(data: &[u8]) -> String {
+    let mut h = Hasher::new();
+    h.update(data);
+    h.finalize().to_hex().to_string()
+}
 
 impl CompressionStage for SemanticDedupStage {
     fn stage(&self) -> Stage {
@@ -27,59 +26,83 @@ impl CompressionStage for SemanticDedupStage {
     }
 
     fn compress(&self, input: &[u8], _schema: Schema) -> BpResult<Vec<u8>> {
-        let mut store = ChunkStore::new();
-        let mut refs  = Vec::new();
+        let records: Vec<serde_json::Value> = serde_json::from_slice(input)
+            .map_err(|e| BpError::PipelineFailed {
+                stage:  "semantic-dedup".into(),
+                reason: e.to_string(),
+            })?;
 
-        for chunk in input.chunks(CHUNK_SIZE) {
-            let hash = store.put(chunk);
-            refs.push(hash);
+        // store: hash → record (unique records only)
+        let mut store: HashMap<String, serde_json::Value> = HashMap::new();
+        let mut refs:  Vec<serde_json::Value> = Vec::with_capacity(records.len());
+        let mut dupes  = 0usize;
+
+        for record in &records {
+            let bytes = serde_json::to_vec(record)
+                .map_err(|e| BpError::PipelineFailed {
+                    stage:  "semantic-dedup".into(),
+                    reason: e.to_string(),
+                })?;
+            let hash = blake3_hash(&bytes);
+
+            if !store.contains_key(&hash) {
+                store.insert(hash.clone(), record.clone());
+                refs.push(record.clone()); // first occurrence — keep full record
+            } else {
+                dupes += 1;
+                // Replace duplicate with a reference
+                refs.push(serde_json::json!({ "_ref": &hash }));
+            }
         }
 
-        let stats = store.stats();
+        let unique = store.len();
+        let ratio  = records.len() as f64 / unique.max(1) as f64;
+
         info!(
-            ratio      = format!("{:.1}x", stats.ratio),
-            dupes      = stats.dupes,
-            unique     = stats.chunks,
-            total_in   = stats.total_in,
-            unique_out = stats.unique_out,
+            records = records.len(),
+            unique  = unique,
+            dupes   = dupes,
+            ratio   = format!("{:.1}x", ratio),
             "dedup stage complete"
         );
 
-        let store_bytes = store.to_bytes().map_err(|e| BpError::PipelineFailed {
-            stage:  "semantic-dedup".into(),
-            reason: e.to_string(),
-        })?;
+        // Output: {"_store": {hash: record}, "_refs": [...]}
+        // Still serializable as a known structure downstream stages unwrap
+        let out = serde_json::json!({
+            "_dedup": true,
+            "_store": store,
+            "_refs":  refs,
+        });
 
-        // Pass original data through for downstream stages
-        let frame = DedupFrame {
-            store_bytes,
-            refs,
-            original_size: input.len() as u64,
-            data: input.to_vec(),
-        };
-
-        serde_json::to_vec(&frame).map_err(|e| BpError::PipelineFailed {
+        serde_json::to_vec(&out).map_err(|e| BpError::PipelineFailed {
             stage:  "semantic-dedup".into(),
             reason: e.to_string(),
         })
     }
 
     fn decompress(&self, input: &[u8], _schema: Schema) -> BpResult<Vec<u8>> {
-        let frame: DedupFrame = serde_json::from_slice(input)
+        let val: serde_json::Value = serde_json::from_slice(input)
             .map_err(|e| BpError::DecompressionFailed(e.to_string()))?;
 
-        let store = ChunkStore::from_bytes(&frame.store_bytes)
-            .map_err(|e| BpError::DecompressionFailed(e.to_string()))?;
+        let store = val["_store"].as_object()
+            .ok_or_else(|| BpError::DecompressionFailed("missing _store".into()))?;
+        let refs  = val["_refs"].as_array()
+            .ok_or_else(|| BpError::DecompressionFailed("missing _refs".into()))?;
 
-        let mut output = Vec::with_capacity(frame.original_size as usize);
-        for hash in &frame.refs {
-            let chunk = store.get(hash)
-                .ok_or_else(|| BpError::DecompressionFailed(
-                    format!("chunk ref not found: {}", hash)
-                ))?;
-            output.extend_from_slice(chunk);
+        let mut records = Vec::with_capacity(refs.len());
+        for r in refs {
+            if let Some(hash) = r.get("_ref").and_then(|v| v.as_str()) {
+                let record = store.get(hash)
+                    .ok_or_else(|| BpError::DecompressionFailed(
+                        format!("ref not found: {}", hash)
+                    ))?;
+                records.push(record.clone());
+            } else {
+                records.push(r.clone());
+            }
         }
 
-        Ok(output)
+        serde_json::to_vec(&records)
+            .map_err(|e| BpError::DecompressionFailed(e.to_string()))
     }
 }
