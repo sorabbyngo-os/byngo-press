@@ -1,16 +1,10 @@
 use tracing::info;
 use std::collections::HashMap;
-
 use bp_core::error::{BpError, BpResult};
 use bp_core::pipeline::CompressionStage;
 use bp_core::profile::Stage;
 use bp_core::schema::Schema;
-
 use blake3::Hasher;
-
-/// Dedup works at the record level — identical records are stored once
-/// Output is still a JSON array, but with duplicate records replaced by refs
-/// Format: array where each element is either the record or {"_ref": "hash"}
 
 pub struct SemanticDedupStage;
 
@@ -32,10 +26,9 @@ impl CompressionStage for SemanticDedupStage {
                 reason: e.to_string(),
             })?;
 
-        // store: hash → record (unique records only)
         let mut store: HashMap<String, serde_json::Value> = HashMap::new();
         let mut refs:  Vec<serde_json::Value> = Vec::with_capacity(records.len());
-        let mut dupes  = 0usize;
+        let mut dupes = 0usize;
 
         for record in &records {
             let bytes = serde_json::to_vec(record)
@@ -44,20 +37,17 @@ impl CompressionStage for SemanticDedupStage {
                     reason: e.to_string(),
                 })?;
             let hash = blake3_hash(&bytes);
-
             if !store.contains_key(&hash) {
                 store.insert(hash.clone(), record.clone());
-                refs.push(record.clone()); // first occurrence — keep full record
+                refs.push(record.clone());
             } else {
                 dupes += 1;
-                // Replace duplicate with a reference
                 refs.push(serde_json::json!({ "_ref": &hash }));
             }
         }
 
         let unique = store.len();
         let ratio  = records.len() as f64 / unique.max(1) as f64;
-
         info!(
             records = records.len(),
             unique  = unique,
@@ -66,14 +56,14 @@ impl CompressionStage for SemanticDedupStage {
             "dedup stage complete"
         );
 
-        // Output: {"_store": {hash: record}, "_refs": [...]}
-        // Still serializable as a known structure downstream stages unwrap
+        // Emit the dedup frame. Downstream stages (domain, dictionary, delta)
+        // must carry the _store and _refs fields forward transparently so
+        // dedup decompress can reconstruct the original records.
         let out = serde_json::json!({
             "_dedup": true,
             "_store": store,
             "_refs":  refs,
         });
-
         serde_json::to_vec(&out).map_err(|e| BpError::PipelineFailed {
             stage:  "semantic-dedup".into(),
             reason: e.to_string(),
@@ -84,6 +74,8 @@ impl CompressionStage for SemanticDedupStage {
         let val: serde_json::Value = serde_json::from_slice(input)
             .map_err(|e| BpError::DecompressionFailed(e.to_string()))?;
 
+        // Input should be the dedup frame with _store and _refs restored
+        // by the time all inner stages have unwound
         let store = val["_store"].as_object()
             .ok_or_else(|| BpError::DecompressionFailed("missing _store".into()))?;
         let refs  = val["_refs"].as_array()

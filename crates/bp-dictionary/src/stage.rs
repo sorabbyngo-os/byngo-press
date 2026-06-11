@@ -17,14 +17,29 @@ struct DictFrame {
 
 pub struct DictionaryStage;
 
-fn parse_records(input: &[u8]) -> Vec<serde_json::Value> {
-    if let Ok(arr) = serde_json::from_slice::<Vec<serde_json::Value>>(input) {
-        return arr;
+fn extract_records(input: &[u8]) -> BpResult<(Vec<serde_json::Value>, Option<serde_json::Value>)> {
+    let val: serde_json::Value = serde_json::from_slice(input)
+        .map_err(|e| BpError::PipelineFailed {
+            stage:  "dictionary".into(),
+            reason: e.to_string(),
+        })?;
+
+    // Dedup frame — records live in _refs
+    if val.get("_dedup").is_some() {
+        let refs = val["_refs"].as_array()
+            .ok_or_else(|| BpError::PipelineFailed {
+                stage:  "dictionary".into(),
+                reason: "missing _refs".into(),
+            })?
+            .clone();
+        return Ok((refs, Some(val)));
     }
-    if let Ok(val) = serde_json::from_slice::<serde_json::Value>(input) {
-        return vec![val];
+
+    if let serde_json::Value::Array(arr) = val {
+        return Ok((arr, None));
     }
-    vec![]
+
+    Ok((vec![val], None))
 }
 
 impl CompressionStage for DictionaryStage {
@@ -33,7 +48,7 @@ impl CompressionStage for DictionaryStage {
     }
 
     fn compress(&self, input: &[u8], _schema: Schema) -> BpResult<Vec<u8>> {
-        let records = parse_records(input);
+        let (records, dedup_frame) = extract_records(input)?;
 
         let mut builder = DictionaryBuilder::new();
         for record in &records {
@@ -58,7 +73,13 @@ impl CompressionStage for DictionaryStage {
                 reason: e.to_string(),
             })?;
 
-        let frame = DictFrame { dictionary: dict, encoded_data };
+        // Embed DictFrame. If there's a dedup frame, store it inside so it
+        // travels through delta and entropy and comes back intact on decompress.
+        let frame = serde_json::json!({
+            "dictionary":   dict,
+            "encoded_data": encoded_data,
+            "dedup_frame":  dedup_frame,  // null if no dedup frame
+        });
 
         serde_json::to_vec(&frame).map_err(|e| BpError::PipelineFailed {
             stage:  "dictionary".into(),
@@ -67,17 +88,31 @@ impl CompressionStage for DictionaryStage {
     }
 
     fn decompress(&self, input: &[u8], _schema: Schema) -> BpResult<Vec<u8>> {
-        let frame: DictFrame = serde_json::from_slice(input)
+        let frame: serde_json::Value = serde_json::from_slice(input)
             .map_err(|e| BpError::DecompressionFailed(e.to_string()))?;
 
-        let encoded: Vec<serde_json::Value> = serde_json::from_slice(&frame.encoded_data)
+        let dict: Dictionary = serde_json::from_value(frame["dictionary"].clone())
+            .map_err(|e| BpError::DecompressionFailed(e.to_string()))?;
+
+        let encoded_data: Vec<u8> = serde_json::from_value(frame["encoded_data"].clone())
+            .map_err(|e| BpError::DecompressionFailed(e.to_string()))?;
+
+        let encoded: Vec<serde_json::Value> = serde_json::from_slice(&encoded_data)
             .map_err(|e| BpError::DecompressionFailed(e.to_string()))?;
 
         let decoded: Result<Vec<_>, _> = encoded.iter()
-            .map(|r| codec::decode(r, &frame.dictionary))
+            .map(|r| codec::decode(r, &dict))
             .collect();
-
         let records = decoded.map_err(|e| BpError::DecompressionFailed(e.to_string()))?;
+
+        // Restore dedup frame if present — put decoded records back into _refs
+        let dedup_frame = &frame["dedup_frame"];
+        if !dedup_frame.is_null() {
+            let mut df = dedup_frame.clone();
+            df["_refs"] = serde_json::Value::Array(records);
+            return serde_json::to_vec(&df)
+                .map_err(|e| BpError::DecompressionFailed(e.to_string()));
+        }
 
         serde_json::to_vec(&records)
             .map_err(|e| BpError::DecompressionFailed(e.to_string()))

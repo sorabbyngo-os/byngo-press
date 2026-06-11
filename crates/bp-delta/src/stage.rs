@@ -1,47 +1,11 @@
 use tracing::info;
-
 use bp_core::error::{BpError, BpResult};
 use bp_core::pipeline::CompressionStage;
 use bp_core::profile::Stage;
 use bp_core::schema::Schema;
-
 use crate::delta::{compute_sequence, reconstruct_sequence};
 
 pub struct DeltaCompressionStage;
-
-fn extract_records(input: &[u8]) -> BpResult<Vec<serde_json::Value>> {
-    let val: serde_json::Value = serde_json::from_slice(input)
-        .map_err(|e| BpError::PipelineFailed {
-            stage:  "delta-compression".into(),
-            reason: e.to_string(),
-        })?;
-
-    // DictFrame — has "dictionary" and "encoded_data" fields
-    // encoded_data is Vec<u8> serialized as JSON array of numbers
-    if val.get("dictionary").is_some() {
-        if let Some(encoded_data) = val.get("encoded_data") {
-            // encoded_data is a JSON array of u8 numbers
-            let bytes: Vec<u8> = serde_json::from_value(encoded_data.clone())
-                .map_err(|e| BpError::PipelineFailed {
-                    stage:  "delta-compression".into(),
-                    reason: format!("encoded_data decode: {}", e),
-                })?;
-            let arr: Vec<serde_json::Value> = serde_json::from_slice(&bytes)
-                .map_err(|e| BpError::PipelineFailed {
-                    stage:  "delta-compression".into(),
-                    reason: format!("encoded_data parse: {}", e),
-                })?;
-            return Ok(arr);
-        }
-    }
-
-    // Plain array
-    if let serde_json::Value::Array(arr) = val {
-        return Ok(arr);
-    }
-
-    Ok(vec![val])
-}
 
 impl CompressionStage for DeltaCompressionStage {
     fn stage(&self) -> Stage {
@@ -49,21 +13,65 @@ impl CompressionStage for DeltaCompressionStage {
     }
 
     fn compress(&self, input: &[u8], _schema: Schema) -> BpResult<Vec<u8>> {
-        let records = extract_records(input)?;
+        let val: serde_json::Value = serde_json::from_slice(input)
+            .map_err(|e| BpError::PipelineFailed {
+                stage:  "delta-compression".into(),
+                reason: e.to_string(),
+            })?;
 
+        // Detect DictFrame — extract records from encoded_data,
+        // compress to delta bytes, store back in encoded_data, preserve dictionary
+        if val.get("dictionary").is_some() {
+            if let Some(encoded_data_val) = val.get("encoded_data") {
+                let record_bytes: Vec<u8> = serde_json::from_value(encoded_data_val.clone())
+                    .map_err(|e| BpError::PipelineFailed {
+                        stage:  "delta-compression".into(),
+                        reason: format!("encoded_data decode: {}", e),
+                    })?;
+                let records: Vec<serde_json::Value> = serde_json::from_slice(&record_bytes)
+                    .map_err(|e| BpError::PipelineFailed {
+                        stage:  "delta-compression".into(),
+                        reason: format!("encoded_data parse: {}", e),
+                    })?;
+
+                let seq = compute_sequence(&records);
+                let total_fields: usize = seq.deltas.iter().map(|d| d.changed_count()).sum();
+                info!(
+                    records        = records.len(),
+                    deltas         = seq.deltas.len(),
+                    changed_fields = total_fields,
+                    avg_changes    = if seq.deltas.is_empty() { 0.0 } else {
+                        total_fields as f64 / seq.deltas.len() as f64
+                    },
+                    "delta stage complete"
+                );
+
+                let delta_bytes = serde_json::to_vec(&seq)
+                    .map_err(|e| BpError::PipelineFailed {
+                        stage:  "delta-compression".into(),
+                        reason: e.to_string(),
+                    })?;
+
+                // Re-wrap: store delta bytes in encoded_data, keep dictionary field
+                let mut frame = val.as_object().unwrap().clone();
+                frame.insert(
+                    "encoded_data".into(),
+                    serde_json::to_value(&delta_bytes).unwrap(),
+                );
+                return serde_json::to_vec(&serde_json::Value::Object(frame))
+                    .map_err(|e| BpError::PipelineFailed {
+                        stage:  "delta-compression".into(),
+                        reason: e.to_string(),
+                    });
+            }
+        }
+
+        // Plain array (no DictFrame)
+        let records: Vec<serde_json::Value> = match val {
+            serde_json::Value::Array(arr) => arr,
+            other => vec![other],
+        };
         let seq = compute_sequence(&records);
-        let total_fields: usize = seq.deltas.iter().map(|d| d.changed_count()).sum();
-
-        info!(
-            records        = records.len(),
-            deltas         = seq.deltas.len(),
-            changed_fields = total_fields,
-            avg_changes    = if seq.deltas.is_empty() { 0.0 } else {
-                total_fields as f64 / seq.deltas.len() as f64
-            },
-            "delta stage complete"
-        );
-
         serde_json::to_vec(&seq).map_err(|e| BpError::PipelineFailed {
             stage:  "delta-compression".into(),
             reason: e.to_string(),
@@ -71,11 +79,37 @@ impl CompressionStage for DeltaCompressionStage {
     }
 
     fn decompress(&self, input: &[u8], _schema: Schema) -> BpResult<Vec<u8>> {
-        let seq: crate::delta::DeltaSequence = serde_json::from_slice(input)
+        let val: serde_json::Value = serde_json::from_slice(input)
             .map_err(|e| BpError::DecompressionFailed(e.to_string()))?;
 
-        let records = reconstruct_sequence(&seq);
+        // DictFrame: encoded_data holds DeltaSequence bytes
+        // Reconstruct records, put back in encoded_data, return frame for dictionary
+        if val.get("dictionary").is_some() {
+            if let Some(encoded_data_val) = val.get("encoded_data") {
+                let delta_bytes: Vec<u8> = serde_json::from_value(encoded_data_val.clone())
+                    .map_err(|e| BpError::DecompressionFailed(
+                        format!("encoded_data decode: {}", e)
+                    ))?;
+                let seq: crate::delta::DeltaSequence = serde_json::from_slice(&delta_bytes)
+                    .map_err(|e| BpError::DecompressionFailed(e.to_string()))?;
+                let records = reconstruct_sequence(&seq);
+                let record_bytes = serde_json::to_vec(&records)
+                    .map_err(|e| BpError::DecompressionFailed(e.to_string()))?;
 
+                let mut frame = val.as_object().unwrap().clone();
+                frame.insert(
+                    "encoded_data".into(),
+                    serde_json::to_value(&record_bytes).unwrap(),
+                );
+                return serde_json::to_vec(&serde_json::Value::Object(frame))
+                    .map_err(|e| BpError::DecompressionFailed(e.to_string()));
+            }
+        }
+
+        // Plain DeltaSequence
+        let seq: crate::delta::DeltaSequence = serde_json::from_slice(input)
+            .map_err(|e| BpError::DecompressionFailed(e.to_string()))?;
+        let records = reconstruct_sequence(&seq);
         serde_json::to_vec(&records)
             .map_err(|e| BpError::DecompressionFailed(e.to_string()))
     }
