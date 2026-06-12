@@ -26,8 +26,11 @@ impl CompressionStage for SemanticDedupStage {
                 reason: e.to_string(),
             })?;
 
-        let mut store: HashMap<String, serde_json::Value> = HashMap::new();
-        let mut refs:  Vec<serde_json::Value> = Vec::with_capacity(records.len());
+        // hash → integer index into unique_records
+        let mut hash_to_idx: HashMap<String, u32> = HashMap::new();
+        let mut unique_records: Vec<serde_json::Value> = Vec::new();
+        // For each input record: store its index into unique_records
+        let mut indices: Vec<u32> = Vec::with_capacity(records.len());
         let mut dupes = 0usize;
 
         for record in &records {
@@ -37,32 +40,34 @@ impl CompressionStage for SemanticDedupStage {
                     reason: e.to_string(),
                 })?;
             let hash = blake3_hash(&bytes);
-            if !store.contains_key(&hash) {
-                store.insert(hash.clone(), record.clone());
-                refs.push(record.clone());
-            } else {
+            if let Some(&idx) = hash_to_idx.get(&hash) {
+                indices.push(idx);
                 dupes += 1;
-                refs.push(serde_json::json!({ "_ref": &hash }));
+            } else {
+                let idx = unique_records.len() as u32;
+                hash_to_idx.insert(hash, idx);
+                unique_records.push(record.clone());
+                indices.push(idx);
             }
         }
 
-        let unique = store.len();
-        let ratio  = records.len() as f64 / unique.max(1) as f64;
+        let unique = unique_records.len();
         info!(
             records = records.len(),
             unique  = unique,
             dupes   = dupes,
-            ratio   = format!("{:.1}x", ratio),
+            ratio   = format!("{:.1}x", records.len() as f64 / unique.max(1) as f64),
             "dedup stage complete"
         );
 
-        // Emit the dedup frame. Downstream stages (domain, dictionary, delta)
-        // must carry the _store and _refs fields forward transparently so
-        // dedup decompress can reconstruct the original records.
+        // Output: compact format
+        // {"u": [unique records], "i": [u32 indices]}
+        // indices are small integers — compress extremely well
+        // unique records are stored once — no 64-char hash keys
         let out = serde_json::json!({
             "_dedup": true,
-            "_store": store,
-            "_refs":  refs,
+            "u": unique_records,
+            "i": indices,
         });
         serde_json::to_vec(&out).map_err(|e| BpError::PipelineFailed {
             stage:  "semantic-dedup".into(),
@@ -74,24 +79,18 @@ impl CompressionStage for SemanticDedupStage {
         let val: serde_json::Value = serde_json::from_slice(input)
             .map_err(|e| BpError::DecompressionFailed(e.to_string()))?;
 
-        // Input should be the dedup frame with _store and _refs restored
-        // by the time all inner stages have unwound
-        let store = val["_store"].as_object()
-            .ok_or_else(|| BpError::DecompressionFailed("missing _store".into()))?;
-        let refs  = val["_refs"].as_array()
-            .ok_or_else(|| BpError::DecompressionFailed("missing _refs".into()))?;
+        let unique: Vec<serde_json::Value> = serde_json::from_value(val["u"].clone())
+            .map_err(|e| BpError::DecompressionFailed(format!("missing u: {}", e)))?;
+        let indices: Vec<u32> = serde_json::from_value(val["i"].clone())
+            .map_err(|e| BpError::DecompressionFailed(format!("missing i: {}", e)))?;
 
-        let mut records = Vec::with_capacity(refs.len());
-        for r in refs {
-            if let Some(hash) = r.get("_ref").and_then(|v| v.as_str()) {
-                let record = store.get(hash)
-                    .ok_or_else(|| BpError::DecompressionFailed(
-                        format!("ref not found: {}", hash)
-                    ))?;
-                records.push(record.clone());
-            } else {
-                records.push(r.clone());
-            }
+        let mut records = Vec::with_capacity(indices.len());
+        for idx in indices {
+            let record = unique.get(idx as usize)
+                .ok_or_else(|| BpError::DecompressionFailed(
+                    format!("dedup index {} out of range (unique={})", idx, unique.len())
+                ))?;
+            records.push(record.clone());
         }
 
         serde_json::to_vec(&records)

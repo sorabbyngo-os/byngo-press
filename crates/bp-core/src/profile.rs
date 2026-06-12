@@ -38,8 +38,8 @@ impl Profile {
                 Stage::SchemaDetection,
                 Stage::SemanticDedup,
                 Stage::DomainEncoding,
-                Stage::DictionarySubstitution,
                 Stage::DeltaCompression,
+                Stage::DictionarySubstitution,
                 Stage::EntropyCoding,
             ],
             Profile::Swift => &[

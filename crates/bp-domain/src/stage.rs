@@ -15,10 +15,10 @@ fn extract_records(input: &[u8]) -> BpResult<(Vec<serde_json::Value>, Option<ser
         })?;
 
     if val.get("_dedup").is_some() {
-        let refs = val["_refs"].as_array()
+        let refs = val["u"].as_array()
             .ok_or_else(|| BpError::PipelineFailed {
                 stage:  "domain-encoding".into(),
-                reason: "missing _refs in dedup frame".into(),
+                reason: "missing u in dedup frame".into(),
             })?
             .clone();
         return Ok((refs, Some(val)));
@@ -45,7 +45,7 @@ impl CompressionStage for DomainEncodingStage {
             .collect();
 
         if let Some(mut f) = frame {
-            f["_refs"] = serde_json::Value::Array(encoded);
+            f["u"] = serde_json::Value::Array(encoded);
             return serde_json::to_vec(&f).map_err(|e| BpError::PipelineFailed {
                 stage:  "domain-encoding".into(),
                 reason: e.to_string(),
@@ -63,14 +63,14 @@ impl CompressionStage for DomainEncodingStage {
             .map_err(|e| BpError::DecompressionFailed(e.to_string()))?;
 
         if val.get("_dedup").is_some() {
-            let refs = val["_refs"].as_array()
-                .ok_or_else(|| BpError::DecompressionFailed("missing _refs".into()))?
+            let refs = val["u"].as_array()
+                .ok_or_else(|| BpError::DecompressionFailed("missing u".into()))?
                 .clone();
             let decoded: Vec<serde_json::Value> = refs.iter()
                 .map(|r| decode_record(r.clone(), schema))
                 .collect();
             let mut frame = val.clone();
-            frame["_refs"] = serde_json::Value::Array(decoded);
+            frame["u"] = serde_json::Value::Array(decoded);
             return serde_json::to_vec(&frame)
                 .map_err(|e| BpError::DecompressionFailed(e.to_string()));
         }
