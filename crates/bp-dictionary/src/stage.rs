@@ -19,21 +19,21 @@ fn extract_records(input: &[u8]) -> BpResult<(Vec<serde_json::Value>, Option<ser
         })?;
 
     if val.get("_dedup").is_some() {
-        // If "u" is a string, delta already ran and encoded unique records as b64.
-        // Dictionary cannot peek inside a b64 blob — pass the whole frame through as-is.
-        if val["u"].is_string() {
-            // Shell carries everything; empty record list = no substitution
+        // If _delta=true, "u" is a b64 blob — dictionary cannot substitute inside it.
+        // If _delta=false or absent, "u" is a plain array — substitute normally.
+        let delta_applied = val.get("_delta").and_then(|v| v.as_bool()).unwrap_or(false);
+        if delta_applied {
+            // "u" is a DeltaSequence object — cannot substitute inside it, pass through
             return Ok((vec![], Some(val)));
         }
-        // "u" is a plain array — extract records for dictionary substitution
+        // "u" is a plain array of unique records — extract for substitution
         let refs = val["u"].as_array()
             .ok_or_else(|| BpError::PipelineFailed {
                 stage:  "dictionary".into(),
                 reason: "missing u in dedup frame".into(),
             })?
             .clone();
-        // Shell carries "i" and "_dedup"; "u" will be replaced with encoded records
-        let shell = serde_json::json!({ "_dedup": true, "i": val["i"] });
+        let shell = serde_json::json!({ "_dedup": true, "i": val["i"], "_delta": false });
         return Ok((refs, Some(shell)));
     }
 
@@ -52,14 +52,9 @@ impl CompressionStage for DictionaryStage {
     fn compress(&self, input: &[u8], _schema: Schema) -> BpResult<Vec<u8>> {
         let (records, dedup_shell) = extract_records(input)?;
 
-        // Empty records means the frame should pass through unchanged (e.g. post-delta b64)
+        // Empty records = full passthrough — return input bytes unchanged, no dict frame wrapper
         if records.is_empty() {
-            if let Some(shell) = dedup_shell {
-                return serde_json::to_vec(&shell).map_err(|e| BpError::PipelineFailed {
-                    stage:  "dictionary".into(),
-                    reason: e.to_string(),
-                });
-            }
+            return Ok(input.to_vec());
         }
 
         let mut builder = DictionaryBuilder::new();

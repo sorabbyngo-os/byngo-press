@@ -31,15 +31,9 @@ impl CompressionStage for DeltaCompressionStage {
 
             let seq = compute_sequence(&unique);
             let total_fields: usize = seq.deltas.iter().map(|d| d.changed_count()).sum();
-            info!(
-                records        = unique.len(),
-                deltas         = seq.deltas.len(),
-                changed_fields = total_fields,
-                avg_changes    = if seq.deltas.is_empty() { 0.0 } else {
-                    total_fields as f64 / seq.deltas.len() as f64
-                },
-                "delta stage complete"
-            );
+            let avg_changes = if seq.deltas.is_empty() { 0.0 } else {
+                total_fields as f64 / seq.deltas.len() as f64
+            };
 
             let delta_bytes = serde_json::to_vec(&seq)
                 .map_err(|e| BpError::PipelineFailed {
@@ -47,13 +41,51 @@ impl CompressionStage for DeltaCompressionStage {
                     reason: e.to_string(),
                 })?;
 
-            let mut frame = val.as_object().unwrap().clone();
-            frame.insert("u".into(), serde_json::Value::String(B64.encode(&delta_bytes)));
-            return serde_json::to_vec(&serde_json::Value::Object(frame))
+            // Adaptive: only keep delta if it actually shrinks the data.
+            // High avg_changes (>2.5) means records differ too much — delta adds overhead.
+            let original_u_bytes = serde_json::to_vec(&unique)
                 .map_err(|e| BpError::PipelineFailed {
                     stage:  "delta-compression".into(),
                     reason: e.to_string(),
-                });
+                })?;
+            let delta_effective = delta_bytes.len() < original_u_bytes.len();
+
+            info!(
+                records        = unique.len(),
+                deltas         = seq.deltas.len(),
+                changed_fields = total_fields,
+                avg_changes    = avg_changes,
+                delta_bytes    = delta_bytes.len(),
+                original_bytes = original_u_bytes.len(),
+                adaptive_skip  = !delta_effective,
+                "delta stage complete"
+            );
+
+            if delta_effective {
+                // Delta helped — store DeltaSequence as nested JSON object (no b64 overhead)
+                let seq_val = serde_json::to_value(&seq)
+                    .map_err(|e| BpError::PipelineFailed {
+                        stage:  "delta-compression".into(),
+                        reason: e.to_string(),
+                    })?;
+                let mut frame = val.as_object().unwrap().clone();
+                frame.insert("u".into(), seq_val);
+                frame.insert("_delta".into(), serde_json::Value::Bool(true));
+                return serde_json::to_vec(&serde_json::Value::Object(frame))
+                    .map_err(|e| BpError::PipelineFailed {
+                        stage:  "delta-compression".into(),
+                        reason: e.to_string(),
+                    });
+            } else {
+                // Delta hurt — pass frame through unchanged, mark as skipped
+                let mut frame = val.as_object().unwrap().clone();
+                frame.insert("_delta".into(), serde_json::Value::Bool(false));
+                return serde_json::to_vec(&serde_json::Value::Object(frame))
+                    .map_err(|e| BpError::PipelineFailed {
+                        stage:  "delta-compression".into(),
+                        reason: e.to_string(),
+                    });
+            }
         }
 
         // Dict frame: delta-compress encoded_data (b64)
@@ -119,20 +151,27 @@ impl CompressionStage for DeltaCompressionStage {
         let val: serde_json::Value = serde_json::from_slice(input)
             .map_err(|e| BpError::DecompressionFailed(e.to_string()))?;
 
-        // Dedup frame: "u" holds b64-encoded DeltaSequence of unique records
+        // Dedup frame: check _delta flag to know if "u" was delta-compressed
         if val.get("_dedup").is_some() {
-            let b64 = val["u"].as_str()
-                .ok_or_else(|| BpError::DecompressionFailed("u not a string".into()))?;
-            let delta_bytes = B64.decode(b64)
-                .map_err(|e| BpError::DecompressionFailed(format!("b64 decode: {}", e)))?;
-            let seq: crate::delta::DeltaSequence = serde_json::from_slice(&delta_bytes)
-                .map_err(|e| BpError::DecompressionFailed(e.to_string()))?;
-            let unique = reconstruct_sequence(&seq);
+            let delta_was_applied = val.get("_delta")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
 
-            let mut frame = val.as_object().unwrap().clone();
-            frame.insert("u".into(), serde_json::to_value(&unique).unwrap());
-            return serde_json::to_vec(&serde_json::Value::Object(frame))
-                .map_err(|e| BpError::DecompressionFailed(e.to_string()));
+            if delta_was_applied {
+                // "u" is a DeltaSequence JSON object — reconstruct unique records
+                let seq: crate::delta::DeltaSequence =
+                    serde_json::from_value(val["u"].clone())
+                        .map_err(|e| BpError::DecompressionFailed(e.to_string()))?;
+                let unique = reconstruct_sequence(&seq);
+
+                let mut frame = val.as_object().unwrap().clone();
+                frame.insert("u".into(), serde_json::to_value(&unique).unwrap());
+                return serde_json::to_vec(&serde_json::Value::Object(frame))
+                    .map_err(|e| BpError::DecompressionFailed(e.to_string()));
+            } else {
+                // Delta was skipped — pass frame through unchanged
+                return Ok(input.to_vec());
+            }
         }
 
         // Dict frame
