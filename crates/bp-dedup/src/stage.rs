@@ -26,10 +26,8 @@ impl CompressionStage for SemanticDedupStage {
                 reason: e.to_string(),
             })?;
 
-        // hash → integer index into unique_records
         let mut hash_to_idx: HashMap<String, u32> = HashMap::new();
         let mut unique_records: Vec<serde_json::Value> = Vec::new();
-        // For each input record: store its index into unique_records
         let mut indices: Vec<u32> = Vec::with_capacity(records.len());
         let mut dupes = 0usize;
 
@@ -60,10 +58,14 @@ impl CompressionStage for SemanticDedupStage {
             "dedup stage complete"
         );
 
-        // Output: compact format
-        // {"u": [unique records], "i": [u32 indices]}
-        // indices are small integers — compress extremely well
-        // unique records are stored once — no 64-char hash keys
+        // Adaptive: zero duplicates means the {_dedup, u, i} wrapper is pure
+        // overhead (an extra u32 index array + JSON structure for no benefit).
+        // Pass the original array through unchanged.
+        if dupes == 0 {
+            info!(adaptive_skip = true, "dedup skipped — no duplicates found");
+            return Ok(input.to_vec());
+        }
+
         let out = serde_json::json!({
             "_dedup": true,
             "u": unique_records,
@@ -78,6 +80,11 @@ impl CompressionStage for SemanticDedupStage {
     fn decompress(&self, input: &[u8], _schema: Schema) -> BpResult<Vec<u8>> {
         let val: serde_json::Value = serde_json::from_slice(input)
             .map_err(|e| BpError::DecompressionFailed(e.to_string()))?;
+
+        // No _dedup wrapper — dedup was skipped at compress time, pass through
+        if val.get("_dedup").is_none() {
+            return Ok(input.to_vec());
+        }
 
         let unique: Vec<serde_json::Value> = serde_json::from_value(val["u"].clone())
             .map_err(|e| BpError::DecompressionFailed(format!("missing u: {}", e)))?;
