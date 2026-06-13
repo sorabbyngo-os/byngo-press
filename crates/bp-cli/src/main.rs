@@ -148,10 +148,23 @@ fn main() -> Result<()> {
         }
 
         Command::Decompress { input, output } => {
-            let data     = std::fs::read(input)?;
-            let pipeline = build_pipeline(Profile::detect(), Schema::GenericJson);
-            let start    = Instant::now();
-            let out      = pipeline.decompress(&data)?;
+            let data = std::fs::read(input)?;
+            // Read profile/schema from the file envelope so we always use
+            // the exact stage list that compressed this file — no guessing.
+            let (profile, schema, pipeline) =
+                if let Some(Ok(env)) = bp_core::pipeline::BpEnvelope::decode(&data) {
+                    let p = env.profile;
+                    let s = env.schema;
+                    (p, s, build_pipeline(p, s))
+                } else {
+                    // Legacy file — fall back to hardware detection
+                    let p = Profile::detect();
+                    let s = Schema::GenericJson;
+                    (p, s, build_pipeline(p, s))
+                };
+            let _ = (profile, schema); // used above
+            let start = Instant::now();
+            let out   = pipeline.decompress(&data)?;
             let out_path = output.clone().unwrap_or_else(|| {
                 let mut p = input.clone(); p.set_extension("json"); p
             });
